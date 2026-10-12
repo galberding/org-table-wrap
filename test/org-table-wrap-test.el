@@ -573,5 +573,336 @@ Override the available width to WIDTH."
         (should-not (string-suffix-p "\n" before)))
       (org-table-wrap-mode -1))))
 
+;;;; Regression tests
+
+(ert-deftest org-table-wrap-test-global-mode-only-in-org-buffers ()
+  "The globalized mode must not enable itself in non-Org buffers."
+  (unwind-protect
+      (progn
+        (global-org-table-wrap-mode 1)
+        (with-temp-buffer
+          (fundamental-mode)
+          (should-not org-table-wrap-mode))
+        (with-temp-buffer
+          (emacs-lisp-mode)
+          (should-not org-table-wrap-mode))
+        (with-temp-buffer
+          (org-mode)
+          (should org-table-wrap-mode)))
+    (global-org-table-wrap-mode -1)))
+
+;; Shared fixture for the regression tests below.
+(defconst org-table-wrap-test--wide-table
+  (concat
+   "Some text before.\n"
+   "| Very long column header one | Very long column header two |\n"
+   "|-----------------------------+-----------------------------|\n"
+   "| content                     | more content                |\n"
+   "Some text after.\n"))
+
+(defun org-table-wrap-test--live-overlays ()
+  "Return all org-table-wrap overlays in the current buffer."
+  (cl-remove-if-not (lambda (ov) (overlay-get ov 'org-table-wrap))
+                    (overlays-in (point-min) (point-max))))
+
+(defmacro org-table-wrap-test--capturing-idle-timers (var &rest body)
+  "Run BODY with `run-with-idle-timer' stubbed to push calls onto VAR.
+Each element of VAR is (FN . ARGS)."
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'run-with-idle-timer)
+              (lambda (_secs _repeat fn &rest args)
+                (push (cons fn args) ,var)
+                'fake-timer))
+             ((symbol-function 'cancel-timer) #'ignore))
+     ,@body))
+
+(ert-deftest org-table-wrap-test-row-appended-below-wrapped-table ()
+  "Appending a row to a wrapped table must not leave or stack overlays."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (should (= (length (org-table-wrap-test--live-overlays)) 1))
+    (let (timers)
+      (org-table-wrap-test--capturing-idle-timers timers
+        ;; Insert a new row at the very end of the table, then step into it.
+        (goto-char (point-min))
+        (search-forward "Some text after.")
+        (beginning-of-line)
+        (insert "| new row                     | here                        |\n")
+        (forward-line -1)
+        (org-table-wrap--post-command)
+        ;; Point is in the table: it must be fully revealed.
+        (should (null (org-table-wrap-test--live-overlays)))
+        (should (null org-table-wrap--overlays))
+        ;; Leave the table and run the deferred re-wrap.
+        (goto-char (point-min))
+        (org-table-wrap--post-command)
+        (dolist (call (reverse timers))
+          (apply (car call) (cdr call)))))
+    (should (= (length (org-table-wrap-test--live-overlays)) 1))
+    (should (= (length org-table-wrap--overlays) 1))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-edit-under-overlay-invalidates-it ()
+  "Editing a wrapped table from outside must not leave a stale rendering."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (goto-char (point-min))             ; point stays outside the table
+    (let (timers)
+      (org-table-wrap-test--capturing-idle-timers timers
+        (save-excursion
+          (goto-char (point-min))
+          (search-forward "more content")
+          (replace-match "CHANGED CELL"))
+        ;; The outdated snapshot is gone immediately...
+        (should (null (org-table-wrap-test--live-overlays)))
+        (should (null org-table-wrap--overlays))
+        ;; ...and the idle refresh renders the new text.
+        (should timers)
+        (dolist (call (reverse timers))
+          (apply (car call) (cdr call)))))
+    (let ((ovs (org-table-wrap-test--live-overlays)))
+      (should (= (length ovs) 1))
+      (should (string-match-p "CHANGED"
+                              (overlay-get (car ovs) 'before-string))))
+    (should (null org-table-wrap--dirty-markers))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-edits-to-two-tables-refresh-both ()
+  "Changes to several wrapped tables in one command re-render all of them."
+  (org-table-wrap-test-with-width 30
+      (concat org-table-wrap-test--wide-table "\n" org-table-wrap-test--wide-table)
+    (org-table-wrap-mode 1)
+    (should (= (length (org-table-wrap-test--live-overlays)) 2))
+    (goto-char (point-min))
+    (let (timers)
+      (org-table-wrap-test--capturing-idle-timers timers
+        (save-excursion
+          (goto-char (point-min))
+          (while (search-forward "more content" nil t)
+            (replace-match "edited stuff")))
+        (dolist (call (reverse timers))
+          (apply (car call) (cdr call)))))
+    (let ((ovs (org-table-wrap-test--live-overlays)))
+      (should (= (length ovs) 2))
+      (dolist (ov ovs)
+        (should (string-match-p "edited" (overlay-get ov 'before-string)))))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-mode-disable-cancels-dirty-refresh ()
+  "Disabling the mode drops queued refreshes."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (let (timers)
+      (org-table-wrap-test--capturing-idle-timers timers
+        (save-excursion
+          (goto-char (point-min))
+          (search-forward "more content")
+          (replace-match "x"))
+        (should org-table-wrap--dirty-markers)
+        (org-table-wrap-mode -1)
+        (should (null org-table-wrap--dirty-markers))
+        (should (null org-table-wrap--dirty-timer))))))
+
+(ert-deftest org-table-wrap-test-rescan-keeps-wrapped-tables ()
+  "A full re-scan (as after a resize) keeps already wrapped tables wrapped."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (should (= (length (org-table-wrap--find-tables)) 1))
+    (org-table-wrap--process-buffer)
+    (should (= (length org-table-wrap--overlays) 1))
+    (should (= (length (org-table-wrap-test--live-overlays)) 1))
+    (org-table-wrap--process-buffer)
+    (should (= (length org-table-wrap--overlays) 1))
+    (should (= (length (org-table-wrap-test--live-overlays)) 1))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-find-tables-skips-folded ()
+  "Tables inside folded subtrees are still skipped."
+  (org-table-wrap-test-with-buffer
+      (concat "* Heading\n" "| a | b |\n" "* Other\n")
+    (goto-char (point-min))
+    (org-fold-subtree t)
+    (should (null (org-table-wrap--find-tables)))
+    (org-fold-show-all)
+    (should (= (length (org-table-wrap--find-tables)) 1))))
+
+(ert-deftest org-table-wrap-test-wrap-wide-chars-narrow-column ()
+  "Wrapping double-width characters into a 1-column cell terminates."
+  (should (equal (org-table-wrap--wrap-text "漢字漢字" 1)
+                 '("漢" "字" "漢" "字"))))
+
+(ert-deftest org-table-wrap-test-unfolding-wraps-hidden-table ()
+  "A wide table that was folded when the mode started is wrapped on unfold."
+  (org-table-wrap-test-with-width 30
+      (concat "* Heading\n"
+              "| Very long column header one | Very long column header two |\n"
+              "| content                     | more content                |\n"
+              "* Other\n")
+    (org-fold-subtree t)
+    (org-table-wrap-mode 1)
+    (should (null org-table-wrap--overlays))
+    (let (timers)
+      (org-table-wrap-test--capturing-idle-timers timers
+        (goto-char (point-min))
+        (org-cycle)                     ; folded -> children
+        (should timers)
+        (dolist (call (reverse timers))
+          (apply (car call) (cdr call)))))
+    (should (= (length org-table-wrap--overlays) 1))
+    (org-table-wrap-mode -1)
+    (should-not (memq #'org-table-wrap--after-cycle org-cycle-hook))))
+
+(ert-deftest org-table-wrap-test-natural-widths-ignore-invisible-text ()
+  "Natural widths count only visible text, e.g. link descriptions."
+  (let* ((link (concat (propertize "[[https://example.com/a/very/long/path][" 'invisible t)
+                       "docs"
+                       (propertize "]]" 'invisible t)))
+         (widths (org-table-wrap--natural-widths (list (list link "abc")) 2)))
+    (should (= (aref widths 0) 4))
+    (should (= (aref widths 1) 3))))
+
+;;;; Row separators
+
+(defconst org-table-wrap-test--sep-rows
+  '(("Header" "Other")
+    hline
+    ("short" "x")
+    ("this cell is long enough to wrap" "y")
+    ("tiny" "z")
+    ("a" "b"))
+  "Rows: header, hline, then four data rows; only the second wraps.")
+
+(defun org-table-wrap-test--count-separators (str)
+  "Count middle rules (├...┤) in display string STR."
+  (cl-count-if (lambda (line) (string-prefix-p "├" line))
+               (split-string str "\n")))
+
+(ert-deftest org-table-wrap-test-row-separators-off-by-default ()
+  "Without the option only the table's own hline is drawn."
+  (let ((org-table-wrap-row-separators nil))
+    (should (= 1 (org-table-wrap-test--count-separators
+                  (org-table-wrap--build-display-string
+                   org-table-wrap-test--sep-rows (vector 10 5)))))))
+
+(ert-deftest org-table-wrap-test-row-separators-all ()
+  "With t, every pair of adjacent data rows gets a separator."
+  (let ((org-table-wrap-row-separators t))
+    ;; 1 real hline + 3 separators between the 4 data rows; none is
+    ;; added between the header and the real hline.
+    (should (= 4 (org-table-wrap-test--count-separators
+                  (org-table-wrap--build-display-string
+                   org-table-wrap-test--sep-rows (vector 10 5)))))))
+
+(ert-deftest org-table-wrap-test-row-separators-wrapped-only ()
+  "With `wrapped', separators appear only next to multi-line rows."
+  (let ((org-table-wrap-row-separators 'wrapped))
+    ;; Real hline + one rule above and one below the wrapped row.
+    (should (= 3 (org-table-wrap-test--count-separators
+                  (org-table-wrap--build-display-string
+                   org-table-wrap-test--sep-rows (vector 10 5)))))))
+
+(ert-deftest org-table-wrap-test-row-separators-not-doubled-at-hline ()
+  "No separator is added next to an existing hline."
+  (let ((org-table-wrap-row-separators t))
+    (should (= 1 (org-table-wrap-test--count-separators
+                  (org-table-wrap--build-display-string
+                   '(("a" "b") hline ("c" "d")) (vector 5 5)))))))
+
+(ert-deftest org-table-wrap-test-row-separator-char ()
+  "Added separators use `org-table-wrap-row-separator-char'; hlines don't."
+  (let* ((org-table-wrap-row-separators t)
+         (org-table-wrap-row-separator-char "┈")
+         (lines (split-string
+                 (org-table-wrap--build-display-string
+                  org-table-wrap-test--sep-rows (vector 10 5))
+                 "\n"))
+         (rules (cl-remove-if-not (lambda (l) (string-prefix-p "├" l)) lines)))
+    (should (= 4 (length rules)))
+    (should (string-match-p "─" (car rules)))          ; the real hline
+    (should-not (string-match-p "┈" (car rules)))
+    (dolist (r (cdr rules))
+      (should (string-match-p "┈" r))
+      (should-not (string-match-p "─" r)))))
+
+;;;; Window changes
+
+(ert-deftest org-table-wrap-test-resize-skips-unchanged-width ()
+  "A window change that keeps the buffer's window width does not re-scan."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (let ((buf (current-buffer))
+          (width 800)
+          (processed 0))
+      (cl-letf (((symbol-function 'get-buffer-window)
+                 (lambda (&rest _) (selected-window)))
+                ((symbol-function 'window-body-width)
+                 (lambda (&rest _) width)))
+        (setq org-table-wrap--last-window-width 800)
+        (cl-letf (((symbol-function 'org-table-wrap--process-buffer)
+                   (lambda () (when (eq (current-buffer) buf)
+                                (cl-incf processed)))))
+          ;; Another window switched buffers: our width is unchanged.
+          (with-current-buffer buf
+            (should-not (org-table-wrap--width-changed-p)))
+          ;; Our window got narrower: re-scan needed.
+          (setq width 600)
+          (with-current-buffer buf
+            (should (org-table-wrap--width-changed-p))))))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-measure-does-not-redisplay ()
+  "Measuring a rendering must not force a redisplay."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (let ((redisplays 0))
+      (cl-letf (((symbol-function 'redisplay)
+                 (lambda (&rest _) (cl-incf redisplays)))
+                ((symbol-function 'window-text-pixel-size)
+                 (lambda (&rest _) '(100 . 10))))
+        (let ((tb (save-excursion (forward-line 1)
+                                  (cons (org-table-begin) (org-table-end)))))
+          (org-table-wrap--apply-and-measure
+           (selected-window) (car tb) (cdr tb) "x")))
+      (should (= redisplays 0))
+      (org-table-wrap--remove-overlays))))
+
+;;;; Rendering all tables
+
+(ert-deftest org-table-wrap-test-render-all-renders-narrow-table ()
+  "With `org-table-wrap-render-all', a fitting table is rendered unwrapped."
+  (let ((org-table-wrap-render-all t))
+    (org-table-wrap-test-with-width 40 "| a | bb |\n|---+----|\n| c | d  |\n"
+      (org-table-wrap-mode 1)
+      (let ((ovs (org-table-wrap-test--live-overlays)))
+        (should (= (length ovs) 1))
+        (let ((lines (split-string
+                      (substring-no-properties
+                       (overlay-get (car ovs) 'before-string))
+                      "\n" t)))
+          ;; Natural widths: no stretching to the window, no wrapping.
+          (should (equal lines '("┌───┬────┐"
+                                 "│ a │ bb │"
+                                 "├───┼────┤"
+                                 "│ c │ d  │"
+                                 "└───┴────┘")))))
+      (org-table-wrap-mode -1))))
+
+(ert-deftest org-table-wrap-test-render-all-off-leaves-narrow-table ()
+  "By default a fitting table is left as plain Org text."
+  (let ((org-table-wrap-render-all nil))
+    (org-table-wrap-test-with-width 40 "| a | bb |\n| c | d  |\n"
+      (org-table-wrap-mode 1)
+      (should (null (org-table-wrap-test--live-overlays)))
+      (org-table-wrap-mode -1))))
+
+(ert-deftest org-table-wrap-test-render-all-still-wraps-wide-table ()
+  "With `org-table-wrap-render-all', overflowing tables are still wrapped."
+  (let ((org-table-wrap-render-all t))
+    (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+      (org-table-wrap-mode 1)
+      (let* ((ov (car (org-table-wrap-test--live-overlays)))
+             (lines (split-string (overlay-get ov 'before-string) "\n" t)))
+        (should (cl-every (lambda (l) (<= (string-width l) 30)) lines)))
+      (org-table-wrap-mode -1))))
+
 (provide 'org-table-wrap-test)
 ;;; org-table-wrap-test.el ends here

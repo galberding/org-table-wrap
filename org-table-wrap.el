@@ -102,6 +102,16 @@ visually distinct from real hlines."
   :type '(choice (const :tag "Same as hlines" nil)
                  (string :tag "Character")))
 
+(defcustom org-table-wrap-render-all nil
+  "Whether to render every table, not only those that overflow.
+When nil, only tables wider than the available width (see
+`org-table-wrap-width-fraction') are rendered; others are shown as
+plain Org text.  When non-nil, every table gets the box-drawing
+rendering (and `org-table-wrap-row-separators', if enabled).  Tables
+that fit keep their natural column widths; only overflowing ones are
+wrapped."
+  :type 'boolean)
+
 ;;;; Internal variables
 
 ;; Forward declaration; defined by `define-minor-mode' below.
@@ -853,7 +863,8 @@ Apply a wrapping overlay if the table overflows the window."
   (org-table-wrap--remove-overlay-at beg end)
   (let* ((table-width (org-table-wrap--table-width beg end))
          (win-width (org-table-wrap--available-width beg)))
-    (if (<= table-width win-width)
+    (if (and (<= table-width win-width)
+             (not org-table-wrap-render-all))
         ;; Table fits; remove any existing overlay
         (org-table-wrap--remove-overlay-at beg end)
       ;; Table overflows; build wrapped display
@@ -867,10 +878,17 @@ Apply a wrapping overlay if the table overflows the window."
                (avail (max (* ncols org-table-wrap-min-column-width)
                            (- win-width border-overhead)))
                (natural (org-table-wrap--natural-widths rows ncols))
-               (col-widths (org-table-wrap--allocate-widths natural avail))
-               (display-str (org-table-wrap--fit-display
-                             rows col-widths beg end win-width)))
-          (org-table-wrap--apply-overlay beg end display-str))))))
+               ;; Keep natural widths when they fit (only possible with
+               ;; `org-table-wrap-render-all'); otherwise distribute the
+               ;; available width, which stretches columns to fill it.
+               (col-widths
+                (if (<= (apply #'+ (append natural nil)) avail)
+                    (cl-map 'vector (lambda (w) (max 1 w)) natural)
+                  (org-table-wrap--allocate-widths natural avail))))
+          (when (> ncols 0)
+            (org-table-wrap--apply-overlay
+             beg end (org-table-wrap--fit-display
+                      rows col-widths beg end win-width))))))))
 
 (defun org-table-wrap--process-buffer ()
   "Process all tables in the current buffer.

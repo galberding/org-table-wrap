@@ -24,7 +24,6 @@
 @top org-table-wrap: Visual word-wrapping for Org mode tables
 
 This manual describes the features and customization options for the Emacs Lisp file @samp{org-table-wrap.el}.
-
 @end ifnottex
 
 @menu
@@ -85,6 +84,15 @@ The development repository is on @uref{https://github.com/benthamite/org-table-w
 The user option @code{org-table-wrap-use-unicode} controls whether the wrapped table uses Unicode box-drawing characters or ASCII equivalents.  When non-nil (the default), borders are drawn with characters such as @samp{│}, @samp{─}, @samp{┌}, @samp{┘}, @samp{┼}, producing a clean, modern look.  When @code{nil}, the package falls back to @samp{|}, @samp{-}, and @samp{+}, which may be preferable in terminals with limited Unicode support or when copy-pasting table output to plain-text contexts.
 
 The user option @code{org-table-wrap-padding} is an integer specifying the number of spaces between the cell content and the column border on each side.  The default value is @code{1}, which gives cells a comfortable amount of breathing room.  Setting it to @code{0} produces a more compact table, while higher values increase readability at the cost of horizontal space.  Since padding is applied on both sides of each cell in every column, increasing this value by 1 consumes @code{2 * ncols} additional characters of width across the table.
+
+@vindex org-table-wrap-row-separators
+@vindex org-table-wrap-row-separator-char
+
+The user option @code{org-table-wrap-row-separators} draws horizontal rules between data rows in the wrapped rendering, which makes it easier to see where one row ends once its cells span several lines.  With @code{nil} (the default) only the table's own hlines are shown; with @code{t} every pair of adjacent data rows is separated; with @code{wrapped} a rule is drawn only next to rows that actually wrapped onto more than one line.  No rule is added where the table already has an hline, and the buffer text is never changed.  The user option @code{org-table-wrap-row-separator-char} sets the horizontal character used for these added rules; when @code{nil} they look like ordinary hlines, while a lighter character such as @samp{┈} keeps them distinct from the table's real hlines.
+
+@vindex org-table-wrap-render-all
+
+By default only tables wider than the available width are rendered; tables that fit are shown as plain Org text.  Setting the user option @code{org-table-wrap-render-all} to a non-@code{nil} value renders every table with box-drawing borders (and row separators, if enabled), giving all tables a uniform look.  Tables that fit keep their natural column widths; only overflowing tables are wrapped.
 
 @node Column sizing
 @section Column sizing
