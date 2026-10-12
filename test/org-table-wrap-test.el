@@ -904,5 +904,20 @@ Each element of VAR is (FN . ARGS)."
         (should (cl-every (lambda (l) (<= (string-width l) 30)) lines)))
       (org-table-wrap-mode -1))))
 
+;;;; Invisibility
+
+(ert-deftest org-table-wrap-test-hidden-table-has-no-ellipsis ()
+  "The hidden table text must not be replaced by an ellipsis."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (let ((pos (overlay-start (car (org-table-wrap-test--live-overlays)))))
+      ;; `invisible-p' returns t for plain invisibility and another
+      ;; non-nil value when an ellipsis is shown.
+      (should (eq (invisible-p pos) t)))
+    (should (memq 'org-table-wrap buffer-invisibility-spec))
+    (should-not (member '(org-table-wrap . t) buffer-invisibility-spec))
+    (org-table-wrap-mode -1)
+    (should-not (memq 'org-table-wrap buffer-invisibility-spec))))
+
 (provide 'org-table-wrap-test)
 ;;; org-table-wrap-test.el ends here

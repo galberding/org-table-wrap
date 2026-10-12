@@ -624,6 +624,8 @@ Merges FACE with any existing faces at each position."
     (org-table-wrap--clear-overlay-entry entry))
   (setq org-table-wrap--overlays nil)
   ;; Remove our invisibility spec
+  (remove-from-invisibility-spec 'org-table-wrap)
+  ;; Also drop the ellipsis form registered by earlier versions.
   (remove-from-invisibility-spec '(org-table-wrap . t)))
 
 (defun org-table-wrap--remove-overlay-at (beg end)
@@ -655,7 +657,11 @@ rendering).  DISPLAY-STRING is the wrapped rendering."
   ;; Remove any existing overlay for this region
   (org-table-wrap--remove-overlay-at beg end)
   ;; Ensure our invisibility spec is registered
-  (add-to-invisibility-spec '(org-table-wrap . t))
+  ;; Plain atom, not (org-table-wrap . t): the cons form makes Emacs
+  ;; draw an ellipsis ("...") for the hidden table text, which appears
+  ;; in front of the rendering and shifts its first line.
+  (remove-from-invisibility-spec '(org-table-wrap . t))
+  (add-to-invisibility-spec 'org-table-wrap)
   ;; Exclude trailing newline from the overlay so the invisible region
   ;; ends at the last table character; otherwise the newline after the
   ;; table would be swallowed and the before-string would merge with
