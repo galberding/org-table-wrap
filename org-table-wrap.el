@@ -77,6 +77,31 @@ default of 0.75 is conservative; increase it if the wrapped table
 is too narrow for your setup."
   :type 'float)
 
+(defcustom org-table-wrap-row-separators nil
+  "Whether to draw separator lines between data rows in wrapped tables.
+Once cells wrap onto several display lines it can be hard to tell
+where one table row ends and the next begins.  This option draws a
+horizontal rule between adjacent data rows in the wrapped rendering.
+The rules exist only in the display; the buffer is not changed.
+
+nil      -- no extra separators (only the table's own hlines).
+t        -- a separator between every pair of adjacent data rows.
+`wrapped' -- a separator only next to rows that wrapped onto more
+            than one display line.
+
+No separator is added where the table already has an hline."
+  :type '(choice (const :tag "None" nil)
+                 (const :tag "Between all data rows" t)
+                 (const :tag "Only around wrapped rows" wrapped)))
+
+(defcustom org-table-wrap-row-separator-char nil
+  "Horizontal character for separators added by `org-table-wrap-row-separators'.
+When nil, use the same character as the table's own hlines.  A
+lighter character such as \"┈\" or \"╌\" keeps the added separators
+visually distinct from real hlines."
+  :type '(choice (const :tag "Same as hlines" nil)
+                 (string :tag "Character")))
+
 ;;;; Internal variables
 
 ;; Forward declaration; defined by `define-minor-mode' below.
@@ -390,6 +415,18 @@ character-level wrapping for long words."
 
 ;;;; Display string construction
 
+(defun org-table-wrap--row-separator-p (prev-lines cur-lines)
+  "Return non-nil if a separator belongs between two data rows.
+PREV-LINES is the display line count of the previous data row, or nil
+if the previous row was an hline or there was none.  CUR-LINES is the
+display line count of the current row.  Governed by
+`org-table-wrap-row-separators'."
+  (and prev-lines
+       (pcase org-table-wrap-row-separators
+         ('nil nil)
+         ('wrapped (or (> prev-lines 1) (> cur-lines 1)))
+         (_ t))))
+
 (defun org-table-wrap--pad-cell (text width)
   "Pad TEXT with spaces to fill WIDTH display columns.
 Returns a string of exactly WIDTH display columns."
@@ -398,12 +435,14 @@ Returns a string of exactly WIDTH display columns."
         (truncate-string-to-width text width)
       (concat text (make-string (- width text-width) ?\s)))))
 
-(defun org-table-wrap--build-hline (col-widths position)
+(defun org-table-wrap--build-hline (col-widths position &optional horizontal)
   "Build an hline string for the given COL-WIDTHS vector.
-POSITION is one of `top', `middle', or `bottom'."
+POSITION is one of `top', `middle', or `bottom'.  HORIZONTAL, if
+non-nil, is the string used for the horizontal segments instead of
+the default border character."
   (let* ((ncols (length col-widths))
          (padding org-table-wrap-padding)
-         (h (org-table-wrap--char 'horizontal))
+         (h (or horizontal (org-table-wrap--char 'horizontal)))
          (parts nil)
          (left (pcase position
                  ('top (org-table-wrap--char 'top-left))
@@ -477,9 +516,11 @@ Returns a propertized string."
   (let (display-lines
         (has-top-hline (eq (car rows) 'hline))
         (has-bottom-hline (eq (car (last rows)) 'hline)))
-    ;; Process each row
+    ;; Process each row.  PREV-LINE-COUNT is the number of display lines
+    ;; of the preceding data row, or nil after an hline / at the start.
     (let ((row-index 0)
-          (nrows (length rows)))
+          (nrows (length rows))
+          (prev-line-count nil))
       (dolist (row rows)
         (let ((is-first (= row-index 0))
               (is-last (= row-index (1- nrows))))
@@ -492,8 +533,17 @@ Returns a propertized string."
                 (push (org-table-wrap--build-hline col-widths position)
                       display-lines))
             ;; Data row: wrap cells and build display lines
-            (dolist (line (org-table-wrap--render-data-row row col-widths))
-              (push line display-lines))))
+            (let ((row-lines (org-table-wrap--render-data-row row col-widths)))
+              (when (org-table-wrap--row-separator-p
+                     prev-line-count (length row-lines))
+                (push (org-table-wrap--build-hline
+                       col-widths 'middle org-table-wrap-row-separator-char)
+                      display-lines))
+              (dolist (line row-lines)
+                (push line display-lines))
+              (setq prev-line-count (length row-lines)))))
+        (when (eq row 'hline)
+          (setq prev-line-count nil))
         (setq row-index (1+ row-index))))
     ;; Reverse to get correct order, then add missing borders
     (setq display-lines (nreverse display-lines))
