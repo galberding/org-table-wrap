@@ -119,6 +119,19 @@ visually distinct from real hlines."
 (defvar-local org-table-wrap--pending-table-timer nil
   "Idle timer for re-processing the table most recently left by point.")
 
+(defvar-local org-table-wrap--dirty-markers nil
+  "Markers inside wrapped tables whose text changed under the overlay.")
+
+(defvar-local org-table-wrap--dirty-timer nil
+  "Idle timer that re-renders the tables in `org-table-wrap--dirty-markers'.")
+
+(defvar-local org-table-wrap--last-window-width nil
+  "Pixel body width of the window the buffer's tables were last fitted to.
+Used to skip re-scans when a window change did not affect the width.")
+
+(defvar-local org-table-wrap--rescan-timer nil
+  "Idle timer for a full re-scan of the buffer after unfolding.")
+
 (defconst org-table-wrap--idle-delay 0.2
   "Idle delay before deferred visual table updates run.")
 
@@ -196,8 +209,12 @@ Only includes tables that are visible (not inside folded headings/drawers)."
       (goto-char (point-min))
       (while (re-search-forward "^[ \t]*|" nil t)
         (let ((start (line-beginning-position)))
-          ;; Check if this line is visible
-          (when (and (not (org-invisible-p (point)))
+          ;; Skip tables hidden by folding.  `org-invisible-p' cannot be
+          ;; used here: it honours `buffer-invisibility-spec', so it also
+          ;; reports tables hidden by this package's own overlays, which
+          ;; would make every full re-scan (e.g. after a resize) drop and
+          ;; unwrap all currently wrapped tables.
+          (when (and (not (org-fold-folded-p (point)))
                      (org-at-table-p))
             ;; Find the extent of this table
             (let ((end (org-table-end)))
@@ -325,7 +342,10 @@ Returns a vector of widths."
     (dolist (row rows)
       (when (listp row)
         (dotimes (i (min ncols (length row)))
-          (let ((w (string-width (nth i row))))
+          ;; Measure what will be rendered: invisible parts such as
+          ;; link targets are stripped by `--render-data-row'.
+          (let ((w (string-width
+                    (org-table-wrap--visible-text (nth i row)))))
             (when (> w (aref widths i))
               (aset widths i w))))))
     widths))
