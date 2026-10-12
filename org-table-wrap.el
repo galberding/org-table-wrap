@@ -415,6 +415,11 @@ character-level wrapping for long words."
           (let ((remaining word))
             (while (> (string-width remaining) width)
               (let ((chunk (truncate-string-to-width remaining width)))
+                ;; A character wider than WIDTH (e.g. a double-width
+                ;; CJK character with WIDTH 1) yields an empty chunk;
+                ;; emit it on its own line so the loop always advances.
+                (when (string-empty-p chunk)
+                  (setq chunk (substring remaining 0 1)))
                 (push chunk lines)
                 (setq remaining (substring remaining (length chunk)))))
             (when (> (length remaining) 0)
@@ -612,12 +617,19 @@ Merges FACE with any existing faces at each position."
   (remove-from-invisibility-spec '(org-table-wrap . t)))
 
 (defun org-table-wrap--remove-overlay-at (beg end)
-  "Remove the org-table-wrap overlay for the table at BEG..END."
+  "Remove every org-table-wrap overlay overlapping the table at BEG..END.
+Entries are matched by overlap rather than exact bounds: the stored
+end marker does not advance when text is inserted right at the end of
+a table (e.g. a row appended below it), so exact matching would miss
+the overlay, leave it live while point is in the table, and later
+cause a second overlay to be stacked on the same table."
   (setq org-table-wrap--overlays
         (cl-remove-if
          (lambda (entry)
-           (when (and (= (org-table-wrap--overlay-entry-beg entry) beg)
-                      (= (org-table-wrap--overlay-entry-end entry) end))
+           (when (org-table-wrap--ranges-overlap-p
+                  (cons (org-table-wrap--overlay-entry-beg entry)
+                        (org-table-wrap--overlay-entry-end entry))
+                  (cons beg end))
              (let ((ov (nth 2 entry)))
                (when (overlayp ov)
                  (delete-overlay ov)))
@@ -650,6 +662,12 @@ rendering).  DISPLAY-STRING is the wrapped rendering."
                          (if has-trailing-newline "\n" "")))
     (overlay-put ov 'org-table-wrap t)
     (overlay-put ov 'evaporate t)
+    ;; The before-string is a snapshot of the table.  If the hidden text
+    ;; changes while point is elsewhere (recalculation, query-replace,
+    ;; undo, programmatic edits), drop the snapshot and re-render.
+    (dolist (prop '(modification-hooks insert-in-front-hooks
+                    insert-behind-hooks))
+      (overlay-put ov prop (list #'org-table-wrap--overlay-modified)))
     (push (org-table-wrap--make-overlay-entry beg end ov)
           org-table-wrap--overlays)))
 
@@ -660,6 +678,75 @@ rendering).  DISPLAY-STRING is the wrapped rendering."
      (and (<= (org-table-wrap--overlay-entry-beg entry) pos)
           (< pos (org-table-wrap--overlay-entry-end entry))))
    org-table-wrap--overlays))
+
+(defun org-table-wrap--overlay-modified (ov after beg _end &optional _len)
+  "Invalidate wrapped overlay OV after text under it changed.
+Called from the overlay's modification hooks.  AFTER is non-nil for
+the post-change call; BEG is where the change happened.  The stale
+overlay is removed at once so the real text is never hidden behind an
+outdated rendering, and the table is queued for idle re-rendering."
+  (when after
+    (setq org-table-wrap--overlays
+          (cl-remove-if (lambda (entry)
+                          (when (eq (nth 2 entry) ov)
+                            (org-table-wrap--clear-overlay-entry entry)
+                            t))
+                        org-table-wrap--overlays))
+    (when (overlay-buffer ov)
+      (delete-overlay ov))
+    (org-table-wrap--mark-dirty beg)))
+
+(defun org-table-wrap--mark-dirty (pos)
+  "Queue the table at POS for idle re-rendering."
+  (push (copy-marker pos) org-table-wrap--dirty-markers)
+  (unless org-table-wrap--dirty-timer
+    (setq org-table-wrap--dirty-timer
+          (run-with-idle-timer org-table-wrap--idle-delay nil
+                               #'org-table-wrap--refresh-dirty
+                               (current-buffer)))))
+
+(defun org-table-wrap--cancel-dirty-refresh ()
+  "Cancel pending dirty-table refreshes and release their markers."
+  (when org-table-wrap--dirty-timer
+    (cancel-timer org-table-wrap--dirty-timer)
+    (setq org-table-wrap--dirty-timer nil))
+  (dolist (m org-table-wrap--dirty-markers)
+    (set-marker m nil))
+  (setq org-table-wrap--dirty-markers nil))
+
+(defun org-table-wrap--refresh-dirty (buffer)
+  "Re-render the tables in BUFFER queued by `org-table-wrap--mark-dirty'."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq org-table-wrap--dirty-timer nil)
+      (if (> (recursion-depth) 0)
+          ;; Same policy as the leave-table re-wrap: wait for top level.
+          (setq org-table-wrap--dirty-timer
+                (run-with-idle-timer org-table-wrap--idle-delay nil
+                                     #'org-table-wrap--refresh-dirty buffer))
+        (let ((markers org-table-wrap--dirty-markers)
+              (done nil)
+              (debug-on-error nil)
+              (debug-on-quit nil))
+          (setq org-table-wrap--dirty-markers nil)
+          (dolist (m markers)
+            (let ((pos (marker-position m)))
+              (set-marker m nil)
+              (when (and pos org-table-wrap-mode (derived-mode-p 'org-mode))
+                (condition-case err
+                    (save-excursion
+                      (goto-char pos)
+                      (when (org-at-table-p)
+                        (let ((bounds (cons (org-table-begin) (org-table-end))))
+                          (unless (or (member bounds done)
+                                      (org-table-wrap--same-table-p
+                                       bounds org-table-wrap--current-table))
+                            (push bounds done)
+                            (org-table-wrap--process-table
+                             (car bounds) (cdr bounds))))))
+                  (error
+                   (message "org-table-wrap: table refresh failed: %s"
+                            (error-message-string err))))))))))))
 
 ;;;; Core logic
 
@@ -683,20 +770,19 @@ to handle font rendering and display scaling differences."
 (defun org-table-wrap--rendered-line-pixel-width (win pos)
   "Return the pixel width of the visual line at POS as rendered in WIN.
 This measures the actual rendered output, accounting for overlays,
-face remapping, text-scale-mode, and any other display modifications."
-  (with-selected-window win
-    (save-excursion
-      (goto-char pos)
-      (car (window-text-pixel-size
-            win
-            (line-beginning-position)
-            (line-end-position))))))
+face remapping, text-scale-mode, and any other display modifications.
+Point and the window's scroll position are left untouched."
+  (let ((bol (save-excursion (goto-char pos) (line-beginning-position)))
+        (eol (save-excursion (goto-char pos) (line-end-position))))
+    (car (window-text-pixel-size win bol eol))))
 
 (defun org-table-wrap--apply-and-measure (win beg end display-str)
   "Apply DISPLAY-STR as overlay at BEG..END in WIN and return pixel width.
-Calls `redisplay' to ensure accurate measurement."
+`window-text-pixel-size' lays the text out with the display engine
+directly, so no `redisplay' is needed.  Forcing one here used to put
+intermediate states on screen -- with point temporarily moved to the
+table, scrolling windows to it -- and caused visible flicker."
   (org-table-wrap--apply-overlay beg end display-str)
-  (redisplay t)
   (org-table-wrap--rendered-line-pixel-width win beg))
 
 (defun org-table-wrap--fit-display (rows col-widths beg end target-char-width)
@@ -761,6 +847,10 @@ the display string."
 (defun org-table-wrap--process-table (beg end)
   "Process a single table between BEG and END.
 Apply a wrapping overlay if the table overflows the window."
+  ;; Measure the raw table, not our previous rendering of it: with the
+  ;; overlay in place, pixel measurement sees the wrapped before-string
+  ;; instead of the hidden table text.
+  (org-table-wrap--remove-overlay-at beg end)
   (let* ((table-width (org-table-wrap--table-width beg end))
          (win-width (org-table-wrap--available-width beg)))
     (if (<= table-width win-width)
@@ -792,6 +882,7 @@ interactive session, defers processing until the buffer is displayed."
       (cond
        ;; Buffer has a visible window: use it for pixel-accurate measurement
        ((and win (window-live-p win))
+        (setq org-table-wrap--last-window-width (window-body-width win t))
         (with-selected-window win
           (org-table-wrap--process-buffer-1
            (org-table-wrap--find-tables))))
@@ -947,6 +1038,40 @@ BEG-MARKER and END-MARKER delimit the table to process."
   (set-marker beg-marker nil)
   (set-marker end-marker nil))
 
+;;;; Visibility cycling
+
+(defun org-table-wrap--after-cycle (state)
+  "Re-scan the buffer after `org-cycle' revealed text.
+STATE is the visibility state passed by `org-cycle-hook'.  Tables in
+folded subtrees are skipped when scanning, so without this they would
+stay unwrapped after being unfolded."
+  (unless (memq state '(folded overview))
+    (unless org-table-wrap--rescan-timer
+      (setq org-table-wrap--rescan-timer
+            (run-with-idle-timer org-table-wrap--idle-delay nil
+                                 #'org-table-wrap--rescan
+                                 (current-buffer))))))
+
+(defun org-table-wrap--rescan (buffer)
+  "Re-process all visible tables in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq org-table-wrap--rescan-timer nil)
+      (when org-table-wrap-mode
+        (let ((debug-on-error nil)
+              (debug-on-quit nil))
+          (condition-case err
+              (org-table-wrap--process-buffer)
+            (error
+             (message "org-table-wrap: re-scan failed: %s"
+                      (error-message-string err)))))))))
+
+(defun org-table-wrap--cancel-rescan ()
+  "Cancel a pending post-unfold re-scan."
+  (when org-table-wrap--rescan-timer
+    (cancel-timer org-table-wrap--rescan-timer)
+    (setq org-table-wrap--rescan-timer nil)))
+
 ;;;; Window resize handling
 
 (defun org-table-wrap--window-size-changed (_frame)
@@ -963,7 +1088,21 @@ BEG-MARKER and END-MARKER delimit the table to process."
            (dolist (buf (buffer-list))
              (when (buffer-local-value 'org-table-wrap-mode buf)
                (with-current-buffer buf
-                 (org-table-wrap--process-buffer))))))))
+                 (when (org-table-wrap--width-changed-p)
+                   (org-table-wrap--process-buffer)))))))))
+
+(defun org-table-wrap--width-changed-p ()
+  "Return non-nil if the current buffer needs re-fitting after a window change.
+`window-size-change-functions' also runs when any window on the frame
+merely shows a different buffer (e.g. while previewing buffers in
+another window).  Re-fitting is only needed when the width of the
+window showing this buffer actually changed.  Buffers without a window
+return non-nil so that `org-table-wrap--process-buffer' can defer
+re-fitting until they are displayed again."
+  (let ((win (get-buffer-window (current-buffer))))
+    (or (not (and win (window-live-p win)))
+        (not (eql (window-body-width win t)
+                  org-table-wrap--last-window-width)))))
 
 ;;;; Minor modes
 
@@ -979,12 +1118,16 @@ modified."
       (progn
         (org-table-wrap--process-buffer)
         (add-hook 'post-command-hook #'org-table-wrap--post-command nil t)
+        (add-hook 'org-cycle-hook #'org-table-wrap--after-cycle nil t)
         (add-hook 'window-size-change-functions
                   #'org-table-wrap--window-size-changed))
     (remove-hook 'post-command-hook #'org-table-wrap--post-command t)
+    (remove-hook 'org-cycle-hook #'org-table-wrap--after-cycle t)
+    (org-table-wrap--cancel-rescan)
     (remove-hook 'window-configuration-change-hook
                  #'org-table-wrap--deferred-process t)
     (org-table-wrap--cancel-pending-table-process)
+    (org-table-wrap--cancel-dirty-refresh)
     (org-table-wrap--remove-overlays)
     (setq org-table-wrap--current-table nil)
     ;; Only remove the global resize hook when no other buffer uses the mode
@@ -996,8 +1139,11 @@ modified."
                    #'org-table-wrap--window-size-changed))))
 
 (defun org-table-wrap--org-mode-hook ()
-  "Enable `org-table-wrap-mode' in Org buffers."
-  (org-table-wrap-mode 1))
+  "Enable `org-table-wrap-mode' in Org buffers.
+Used as the turn-on function of `global-org-table-wrap-mode', which
+calls it in every buffer, so non-Org buffers must be skipped here."
+  (when (derived-mode-p 'org-mode)
+    (org-table-wrap-mode 1)))
 
 ;;;###autoload
 (define-globalized-minor-mode global-org-table-wrap-mode
