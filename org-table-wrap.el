@@ -26,9 +26,9 @@
 ;;; Commentary:
 
 ;; Org-table-wrap provides visual word-wrapping for Org mode tables that
-;; overflow the window width.  It uses overlays with `display' properties
-;; to replace overflowing tables with a wrapped representation using
-;; Unicode box-drawing characters.  The buffer text is never modified.
+;; overflow the window width.  It uses one overlay per table line whose
+;; `display' property shows that row wrapped and framed with Unicode
+;; box-drawing characters.  The buffer text is never modified.
 ;;
 ;; When point enters a wrapped table, the overlay is removed to allow
 ;; normal editing.  When point leaves, the overlay is re-applied.
@@ -112,6 +112,22 @@ that fit keep their natural column widths; only overflowing ones are
 wrapped."
   :type 'boolean)
 
+(defcustom org-table-wrap-no-reveal-commands
+  '(scroll-up-command scroll-down-command scroll-up scroll-down
+    scroll-other-window scroll-other-window-down
+    mwheel-scroll pixel-scroll-precision pixel-scroll-start-momentum
+    pixel-scroll-interpolate-up pixel-scroll-interpolate-down
+    pixel-scroll-up pixel-scroll-down
+    scroll-bar-toolkit-scroll scroll-bar-drag scroll-bar-scroll-up
+    scroll-bar-scroll-down ultra-scroll)
+  "Commands that do not reveal a rendered table when point lands in it.
+Scrolling moves point along to keep it in the window, which often puts
+it on a table line without any intention to edit that table.
+Revealing the raw table then changes the layout under the user's
+hands.  After these commands the rendering stays; the next other
+command with point in the table reveals it."
+  :type '(repeat function))
+
 ;;;; Internal variables
 
 ;; Forward declaration; defined by `define-minor-mode' below.
@@ -145,11 +161,19 @@ Used to skip re-scans when a window change did not affect the width.")
 (defconst org-table-wrap--idle-delay 0.2
   "Idle delay before deferred visual table updates run.")
 
-(defun org-table-wrap--make-overlay-entry (beg end overlay)
-  "Return an overlay entry for table bounds BEG..END and OVERLAY.
+(defun org-table-wrap--make-overlay-entry (beg end overlays)
+  "Return an overlay entry for table bounds BEG..END and OVERLAYS.
+OVERLAYS is the list of per-line overlays rendering the table.
 The bounds are stored as live markers so they keep tracking the table
 when text is inserted elsewhere in the buffer."
-  (list (copy-marker beg t) (copy-marker end) overlay))
+  (list (copy-marker beg t) (copy-marker end) overlays))
+
+(defun org-table-wrap--delete-entry (entry)
+  "Delete the overlays of ENTRY and release its markers."
+  (dolist (ov (nth 2 entry))
+    (when (overlay-buffer ov)
+      (delete-overlay ov)))
+  (org-table-wrap--clear-overlay-entry entry))
 
 (defun org-table-wrap--overlay-entry-beg (entry)
   "Return the current table start for overlay ENTRY."
@@ -331,6 +355,21 @@ or a list of cell content strings."
             (push parsed rows)))
         (forward-line 1)))
     (nreverse rows)))
+
+(defun org-table-wrap--table-lines (beg end)
+  "Return (BOL . EOL) for each table line between BEG and END.
+Uses the same line selection as `org-table-wrap--parse-table', so
+element N corresponds to row N of the parsed table."
+  (let (lines)
+    (save-excursion
+      (goto-char beg)
+      (while (< (point) end)
+        (let ((bol (line-beginning-position))
+              (eol (line-end-position)))
+          (when (org-table-wrap--parse-row (buffer-substring bol eol))
+            (push (cons bol eol) lines)))
+        (forward-line 1)))
+    (nreverse lines)))
 
 (defun org-table-wrap--num-columns (rows)
   "Return the number of columns from the parsed ROWS."
@@ -544,55 +583,57 @@ and builds one display line per sub-row.  Returns a list of strings."
               lines)))
     (nreverse lines)))
 
+(defun org-table-wrap--build-row-strings (rows col-widths)
+  "Build the wrapped rendering of ROWS as one string per table row.
+COL-WIDTHS is the allocated width vector.  Element N of the result is
+the (possibly multi-line) rendering of the Nth row of ROWS, including
+any row separator drawn above it; the top and bottom borders are
+attached to the first and last element.  Each element is shown in
+place of the corresponding buffer line."
+  (let ((nrows (length rows))
+        (row-index 0)
+        (prev-line-count nil)
+        (result nil))
+    (dolist (row rows)
+      (let ((lines nil))
+        (if (eq row 'hline)
+            (progn
+              (push (org-table-wrap--build-hline
+                     col-widths (cond ((= row-index 0) 'top)
+                                      ((= row-index (1- nrows)) 'bottom)
+                                      (t 'middle)))
+                    lines)
+              (setq prev-line-count nil))
+          (let ((row-lines (org-table-wrap--render-data-row row col-widths)))
+            (when (org-table-wrap--row-separator-p
+                   prev-line-count (length row-lines))
+              (push (org-table-wrap--build-hline
+                     col-widths 'middle org-table-wrap-row-separator-char)
+                    lines))
+            (dolist (line row-lines)
+              (push line lines))
+            (setq prev-line-count (length row-lines))))
+        (setq lines (nreverse lines))
+        (when (and (= row-index 0) (not (eq row 'hline)))
+          (push (org-table-wrap--build-hline col-widths 'top) lines))
+        (when (and (= row-index (1- nrows)) (not (eq row 'hline)))
+          (setq lines (append lines (list (org-table-wrap--build-hline
+                                           col-widths 'bottom)))))
+        (let ((str (mapconcat #'identity lines "\n")))
+          ;; Add org-table face without overwriting existing faces.
+          (org-table-wrap--add-face str 'org-table)
+          (push str result)))
+      (setq row-index (1+ row-index)))
+    (nreverse result)))
+
 (defun org-table-wrap--build-display-string (rows col-widths)
   "Build the full display string for a wrapped table.
 ROWS is the parsed table, COL-WIDTHS is the allocated width vector.
-Returns a propertized string."
-  (let (display-lines
-        (has-top-hline (eq (car rows) 'hline))
-        (has-bottom-hline (eq (car (last rows)) 'hline)))
-    ;; Process each row.  PREV-LINE-COUNT is the number of display lines
-    ;; of the preceding data row, or nil after an hline / at the start.
-    (let ((row-index 0)
-          (nrows (length rows))
-          (prev-line-count nil))
-      (dolist (row rows)
-        (let ((is-first (= row-index 0))
-              (is-last (= row-index (1- nrows))))
-          (if (eq row 'hline)
-              ;; Hline row
-              (let ((position (cond
-                               (is-first 'top)
-                               (is-last 'bottom)
-                               (t 'middle))))
-                (push (org-table-wrap--build-hline col-widths position)
-                      display-lines))
-            ;; Data row: wrap cells and build display lines
-            (let ((row-lines (org-table-wrap--render-data-row row col-widths)))
-              (when (org-table-wrap--row-separator-p
-                     prev-line-count (length row-lines))
-                (push (org-table-wrap--build-hline
-                       col-widths 'middle org-table-wrap-row-separator-char)
-                      display-lines))
-              (dolist (line row-lines)
-                (push line display-lines))
-              (setq prev-line-count (length row-lines)))))
-        (when (eq row 'hline)
-          (setq prev-line-count nil))
-        (setq row-index (1+ row-index))))
-    ;; Reverse to get correct order, then add missing borders
-    (setq display-lines (nreverse display-lines))
-    (unless has-top-hline
-      (push (org-table-wrap--build-hline col-widths 'top) display-lines))
-    (unless has-bottom-hline
-      (setq display-lines
-            (append display-lines
-                    (list (org-table-wrap--build-hline col-widths 'bottom)))))
-    ;; Join into final string
-    (let ((result (mapconcat #'identity display-lines "\n")))
-      ;; Add org-table face without overwriting existing faces (bold, etc.)
-      (org-table-wrap--add-face result 'org-table)
-      result)))
+Returns a propertized string: the row strings of
+`org-table-wrap--build-row-strings' joined by newlines."
+  (mapconcat #'identity
+             (org-table-wrap--build-row-strings rows col-widths)
+             "\n"))
 
 (defun org-table-wrap--add-face (str face)
   "Add FACE to STR without overwriting existing face properties.
@@ -617,15 +658,11 @@ Merges FACE with any existing faces at each position."
 
 (defun org-table-wrap--remove-overlays ()
   "Remove all org-table-wrap overlays from the current buffer."
-  (dolist (entry org-table-wrap--overlays)
-    (let ((ov (nth 2 entry)))
-      (when (overlayp ov)
-        (delete-overlay ov)))
-    (org-table-wrap--clear-overlay-entry entry))
+  (mapc #'org-table-wrap--delete-entry org-table-wrap--overlays)
   (setq org-table-wrap--overlays nil)
-  ;; Remove our invisibility spec
+  ;; Drop invisibility specs registered by earlier versions, which hid
+  ;; the table with an `invisible' overlay.
   (remove-from-invisibility-spec 'org-table-wrap)
-  ;; Also drop the ellipsis form registered by earlier versions.
   (remove-from-invisibility-spec '(org-table-wrap . t)))
 
 (defun org-table-wrap--remove-overlay-at (beg end)
@@ -642,49 +679,42 @@ cause a second overlay to be stacked on the same table."
                   (cons (org-table-wrap--overlay-entry-beg entry)
                         (org-table-wrap--overlay-entry-end entry))
                   (cons beg end))
-             (let ((ov (nth 2 entry)))
-               (when (overlayp ov)
-                 (delete-overlay ov)))
-             (org-table-wrap--clear-overlay-entry entry)
+             (org-table-wrap--delete-entry entry)
              t))
          org-table-wrap--overlays)))
 
-(defun org-table-wrap--apply-overlay (beg end display-string)
-  "Apply an overlay to the table region BEG..END.
-Uses a single overlay with `invisible' (to hide original text while
-keeping point traversal) and `before-string' (to show the wrapped
-rendering).  DISPLAY-STRING is the wrapped rendering."
-  ;; Remove any existing overlay for this region
+(defun org-table-wrap--apply-overlay (beg end row-strings)
+  "Render the table region BEG..END with ROW-STRINGS.
+ROW-STRINGS holds one display string per table line, as returned by
+`org-table-wrap--build-row-strings'.  Each table line gets its own
+overlay whose `display' property shows that row's rendering, so every
+row stays anchored to its own buffer line: windows can start at any
+row, scrolling moves row by row, and line motion reaches each row.
+A single overlay hiding the whole table behind one multi-line string
+made the rendering behave like one giant line when scrolling."
   (org-table-wrap--remove-overlay-at beg end)
-  ;; Ensure our invisibility spec is registered
-  ;; Plain atom, not (org-table-wrap . t): the cons form makes Emacs
-  ;; draw an ellipsis ("...") for the hidden table text, which appears
-  ;; in front of the rendering and shifts its first line.
-  (remove-from-invisibility-spec '(org-table-wrap . t))
-  (add-to-invisibility-spec 'org-table-wrap)
-  ;; Exclude trailing newline from the overlay so the invisible region
-  ;; ends at the last table character; otherwise the newline after the
-  ;; table would be swallowed and the before-string would merge with
-  ;; the following line.
-  (let* ((has-trailing-newline (and (> end beg)
-                                    (= (char-before end) ?\n)))
-         (ov-end (if has-trailing-newline
-                     (1- end)
-                   end))
-         (ov (make-overlay beg ov-end nil nil nil)))
-    (overlay-put ov 'invisible 'org-table-wrap)
-    (overlay-put ov 'before-string
-                 (concat display-string
-                         (if has-trailing-newline "\n" "")))
-    (overlay-put ov 'org-table-wrap t)
-    (overlay-put ov 'evaporate t)
-    ;; The before-string is a snapshot of the table.  If the hidden text
-    ;; changes while point is elsewhere (recalculation, query-replace,
-    ;; undo, programmatic edits), drop the snapshot and re-render.
-    (dolist (prop '(modification-hooks insert-in-front-hooks
-                    insert-behind-hooks))
-      (overlay-put ov prop (list #'org-table-wrap--overlay-modified)))
-    (push (org-table-wrap--make-overlay-entry beg end ov)
+  (let ((lines (org-table-wrap--table-lines beg end))
+        (overlays nil)
+        ;; Shared by all overlays of this table, to tell tables apart.
+        (table-id (list 'table)))
+    (unless (= (length lines) (length row-strings))
+      (error "org-table-wrap: %d table lines but %d rendered rows"
+             (length lines) (length row-strings)))
+    (cl-loop
+     for (bol . eol) in lines
+     for str in row-strings
+     do (let ((ov (make-overlay bol eol nil nil nil)))
+          (overlay-put ov 'display str)
+          (overlay-put ov 'org-table-wrap table-id)
+          (overlay-put ov 'evaporate t)
+          ;; The display string is a snapshot.  If the text below changes
+          ;; while point is elsewhere (recalculation, query-replace, undo,
+          ;; programmatic edits), drop the rendering and re-render.
+          (dolist (prop '(modification-hooks insert-in-front-hooks
+                          insert-behind-hooks))
+            (overlay-put ov prop (list #'org-table-wrap--overlay-modified)))
+          (push ov overlays)))
+    (push (org-table-wrap--make-overlay-entry beg end (nreverse overlays))
           org-table-wrap--overlays)))
 
 (defun org-table-wrap--find-overlay-at (pos)
@@ -704,8 +734,8 @@ outdated rendering, and the table is queued for idle re-rendering."
   (when after
     (setq org-table-wrap--overlays
           (cl-remove-if (lambda (entry)
-                          (when (eq (nth 2 entry) ov)
-                            (org-table-wrap--clear-overlay-entry entry)
+                          (when (memq ov (nth 2 entry))
+                            (org-table-wrap--delete-entry entry)
                             t))
                         org-table-wrap--overlays))
     (when (overlay-buffer ov)
@@ -792,23 +822,25 @@ Point and the window's scroll position are left untouched."
         (eol (save-excursion (goto-char pos) (line-end-position))))
     (car (window-text-pixel-size win bol eol))))
 
-(defun org-table-wrap--apply-and-measure (win beg end display-str)
-  "Apply DISPLAY-STR as overlay at BEG..END in WIN and return pixel width.
+(defun org-table-wrap--apply-and-measure (win beg end row-strings)
+  "Apply ROW-STRINGS as overlays at BEG..END in WIN and return pixel width.
 `window-text-pixel-size' lays the text out with the display engine
 directly, so no `redisplay' is needed.  Forcing one here used to put
 intermediate states on screen -- with point temporarily moved to the
 table, scrolling windows to it -- and caused visible flicker."
-  (org-table-wrap--apply-overlay beg end display-str)
+  (org-table-wrap--apply-overlay beg end row-strings)
+  ;; The first table line shows the top border, which spans the full
+  ;; rendered width.
   (org-table-wrap--rendered-line-pixel-width win beg))
 
 (defun org-table-wrap--fit-display (rows col-widths beg end target-char-width)
-  "Build a display string from ROWS and COL-WIDTHS that fits the window.
+  "Build row display strings from ROWS and COL-WIDTHS that fits the window.
 BEG and END are the table region bounds.  TARGET-CHAR-WIDTH is the
 window width in characters.  After applying the overlay, measures the
 actual rendered pixel width and shrinks columns if needed.  Returns
-the display string."
+the list of row strings."
   ;; Phase 1: character-based render using the pre-allocated column widths.
-  (let* ((display-str (org-table-wrap--build-display-string rows col-widths))
+  (let* ((row-strings (org-table-wrap--build-row-strings rows col-widths))
          (win (or (get-buffer-window (current-buffer)) (selected-window)))
          (win-px (if (and (not noninteractive) win (window-live-p win))
                      (window-body-width win t)
@@ -820,7 +852,7 @@ the display string."
     ;; needed.
     (when (and (not noninteractive) win (window-live-p win))
       (let ((rendered-px (org-table-wrap--apply-and-measure
-                          win beg end display-str)))
+                          win beg end row-strings)))
         (when (> rendered-px win-px)
           ;; Phase 2a: proportional shrink — scale every column by the
           ;; pixel overshoot ratio to get close to the target in one step.
@@ -830,10 +862,10 @@ the display string."
             (dotimes (i ncols)
               (aset col-widths i
                     (max min-w (floor (* (aref col-widths i) ratio)))))
-            (setq display-str
-                  (org-table-wrap--build-display-string rows col-widths))
+            (setq row-strings
+                  (org-table-wrap--build-row-strings rows col-widths))
             (setq rendered-px
-                  (org-table-wrap--apply-and-measure win beg end display-str))
+                  (org-table-wrap--apply-and-measure win beg end row-strings))
             ;; Phase 2b: fine-tune — the proportional shrink often leaves a
             ;; 1–3 character overshoot due to rounding.  Trim the widest
             ;; column by 1 character per iteration until it fits.  Cap at 5
@@ -852,20 +884,20 @@ the display string."
                     (setq iter max-iter))
                   (aset col-widths widest-idx
                         (max min-w (1- (aref col-widths widest-idx)))))
-                (setq display-str
-                      (org-table-wrap--build-display-string rows col-widths))
+                (setq row-strings
+                      (org-table-wrap--build-row-strings rows col-widths))
                 (setq rendered-px
                       (org-table-wrap--apply-and-measure
-                       win beg end display-str))
+                       win beg end row-strings))
                 (setq iter (1+ iter))))))))
-    display-str))
+    row-strings))
 
 (defun org-table-wrap--process-table (beg end)
   "Process a single table between BEG and END.
 Apply a wrapping overlay if the table overflows the window."
   ;; Measure the raw table, not our previous rendering of it: with the
-  ;; overlay in place, pixel measurement sees the wrapped before-string
-  ;; instead of the hidden table text.
+  ;; overlays in place, pixel measurement sees the wrapped rendering
+  ;; instead of the table text.
   (org-table-wrap--remove-overlay-at beg end)
   (let* ((table-width (org-table-wrap--table-width beg end))
          (win-width (org-table-wrap--available-width beg)))
@@ -942,8 +974,9 @@ interactive session, defers processing until the buffer is displayed."
                 (setq found t)))
             (if found
                 (push entry valid-overlays)
-              (when (overlayp (nth 2 entry))
-                (delete-overlay (nth 2 entry)))
+              (dolist (ov (nth 2 entry))
+                (when (overlay-buffer ov)
+                  (delete-overlay ov)))
               (org-table-wrap--clear-overlay-entry entry))))
         (setq org-table-wrap--overlays (nreverse valid-overlays)))
       ;; Process each table (skip the one point is in)
@@ -958,8 +991,9 @@ interactive session, defers processing until the buffer is displayed."
 
 (defun org-table-wrap--post-command ()
   "Track point movement relative to tables, toggling overlays.
-With `invisible' overlays (not `display'), point can traverse the
-table region normally, so `org-at-table-p' works."
+Entering a rendered table reveals its text for editing, except after
+commands in `org-table-wrap-no-reveal-commands' (scrolling); leaving a
+table re-renders it."
   (when (and org-table-wrap-mode (derived-mode-p 'org-mode))
     (let* ((in-table (org-table-wrap--point-in-table-p))
            (same-table (org-table-wrap--same-table-p
@@ -969,6 +1003,11 @@ table region normally, so `org-at-table-p' works."
         ;; Table bounds can shift while editing, e.g. after adding rows.
         (setq org-table-wrap--current-table in-table))
        (t
+        ;; Point was only carried into a table by scrolling: keep it
+        ;; rendered.
+        (when (and in-table
+                   (memq this-command org-table-wrap-no-reveal-commands))
+          (setq in-table nil))
         ;; Re-wrap the table we left (if any).
         (when org-table-wrap--current-table
           (org-table-wrap--schedule-table-process

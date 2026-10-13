@@ -226,12 +226,16 @@ Override the available width to WIDTH."
     (org-table-wrap-test-with-width 40 wide-table
       (org-table-wrap-mode 1)
       (should (= (length org-table-wrap--overlays) 1))
-      ;; Verify the overlay has invisible + before-string
+      ;; Verify one display overlay per table line (3 lines)
       (let* ((entry (car org-table-wrap--overlays))
-             (ov (nth 2 entry)))
-        (should (overlayp ov))
-        (should (eq (overlay-get ov 'invisible) 'org-table-wrap))
-        (should (stringp (overlay-get ov 'before-string))))
+             (ovs (nth 2 entry)))
+        (should (= (length ovs) 3))
+        (dolist (ov ovs)
+          (should (overlayp ov))
+          (should (stringp (overlay-get ov 'display)))
+          (should (= (overlay-end ov)
+                     (save-excursion (goto-char (overlay-start ov))
+                                     (line-end-position))))))
       (org-table-wrap-mode -1))))
 
 ;;;; Entering and leaving table toggles overlay
@@ -566,9 +570,7 @@ Override the available width to WIDTH."
           "| content                     | more content                |")))
     (org-table-wrap-test-with-width 30 wide-table
       (org-table-wrap-mode 1)
-      (let* ((entry (car org-table-wrap--overlays))
-             (ov (nth 2 entry))
-             (before (overlay-get ov 'before-string)))
+      (let* ((before (car (org-table-wrap-test--live-overlays))))
         (should (= (length org-table-wrap--overlays) 1))
         (should-not (string-suffix-p "\n" before)))
       (org-table-wrap-mode -1))))
@@ -601,9 +603,21 @@ Override the available width to WIDTH."
    "Some text after.\n"))
 
 (defun org-table-wrap-test--live-overlays ()
-  "Return all org-table-wrap overlays in the current buffer."
-  (cl-remove-if-not (lambda (ov) (overlay-get ov 'org-table-wrap))
-                    (overlays-in (point-min) (point-max))))
+  "Return the rendering of every rendered table in the current buffer.
+One string per table: the display strings of the table's live per-line
+overlays, in buffer order, joined by newlines."
+  (let ((groups nil))
+    (dolist (ov (sort (cl-remove-if-not
+                       (lambda (ov) (overlay-get ov 'org-table-wrap))
+                       (overlays-in (point-min) (point-max)))
+                      (lambda (a b) (< (overlay-start a) (overlay-start b)))))
+      (let* ((id (overlay-get ov 'org-table-wrap))
+             (cell (assq id groups)))
+        (if cell
+            (setcdr cell (append (cdr cell) (list (overlay-get ov 'display))))
+          (setq groups (append groups
+                               (list (list id (overlay-get ov 'display))))))))
+    (mapcar (lambda (g) (mapconcat #'identity (cdr g) "\n")) groups)))
 
 (defmacro org-table-wrap-test--capturing-idle-timers (var &rest body)
   "Run BODY with `run-with-idle-timer' stubbed to push calls onto VAR.
@@ -663,7 +677,7 @@ Each element of VAR is (FN . ARGS)."
     (let ((ovs (org-table-wrap-test--live-overlays)))
       (should (= (length ovs) 1))
       (should (string-match-p "CHANGED"
-                              (overlay-get (car ovs) 'before-string))))
+                              (car ovs))))
     (should (null org-table-wrap--dirty-markers))
     (org-table-wrap-mode -1)))
 
@@ -685,7 +699,7 @@ Each element of VAR is (FN . ARGS)."
     (let ((ovs (org-table-wrap-test--live-overlays)))
       (should (= (length ovs) 2))
       (dolist (ov ovs)
-        (should (string-match-p "edited" (overlay-get ov 'before-string)))))
+        (should (string-match-p "edited" ov))))
     (org-table-wrap-mode -1)))
 
 (ert-deftest org-table-wrap-test-mode-disable-cancels-dirty-refresh ()
@@ -861,7 +875,7 @@ Each element of VAR is (FN . ARGS)."
         (let ((tb (save-excursion (forward-line 1)
                                   (cons (org-table-begin) (org-table-end)))))
           (org-table-wrap--apply-and-measure
-           (selected-window) (car tb) (cdr tb) "x")))
+           (selected-window) (car tb) (cdr tb) '("a" "b" "c"))))
       (should (= redisplays 0))
       (org-table-wrap--remove-overlays))))
 
@@ -876,7 +890,7 @@ Each element of VAR is (FN . ARGS)."
         (should (= (length ovs) 1))
         (let ((lines (split-string
                       (substring-no-properties
-                       (overlay-get (car ovs) 'before-string))
+                       (car ovs))
                       "\n" t)))
           ;; Natural widths: no stretching to the window, no wrapping.
           (should (equal lines '("┌───┬────┐"
@@ -900,24 +914,94 @@ Each element of VAR is (FN . ARGS)."
     (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
       (org-table-wrap-mode 1)
       (let* ((ov (car (org-table-wrap-test--live-overlays)))
-             (lines (split-string (overlay-get ov 'before-string) "\n" t)))
+             (lines (split-string ov "\n" t)))
         (should (cl-every (lambda (l) (<= (string-width l) 30)) lines)))
       (org-table-wrap-mode -1))))
 
-;;;; Invisibility
+;;;; Per-line rendering
 
-(ert-deftest org-table-wrap-test-hidden-table-has-no-ellipsis ()
-  "The hidden table text must not be replaced by an ellipsis."
+(ert-deftest org-table-wrap-test-rendering-uses-no-invisibility ()
+  "Tables are rendered with `display', never `invisible' (no ellipsis)."
   (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
     (org-table-wrap-mode 1)
-    (let ((pos (overlay-start (car (org-table-wrap-test--live-overlays)))))
-      ;; `invisible-p' returns t for plain invisibility and another
-      ;; non-nil value when an ellipsis is shown.
-      (should (eq (invisible-p pos) t)))
-    (should (memq 'org-table-wrap buffer-invisibility-spec))
+    (should (org-table-wrap-test--live-overlays))
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (overlay-get ov 'org-table-wrap)
+        (should-not (overlay-get ov 'invisible))
+        (should-not (overlay-get ov 'before-string))))
+    (should-not (memq 'org-table-wrap buffer-invisibility-spec))
     (should-not (member '(org-table-wrap . t) buffer-invisibility-spec))
-    (org-table-wrap-mode -1)
-    (should-not (memq 'org-table-wrap buffer-invisibility-spec))))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-each-row-anchored-to-its-line ()
+  "Each table line shows exactly its own row, so windows can start at any row."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (let ((ovs (nth 2 (car org-table-wrap--overlays))))
+      (should (= (length ovs) 3))
+      ;; Line 1: top border + header; line 2: hline; line 3: data + bottom.
+      (should (string-prefix-p "┌" (overlay-get (nth 0 ovs) 'display)))
+      (should (string-match-p "Very" (overlay-get (nth 0 ovs) 'display)))
+      (should (string-prefix-p "├" (overlay-get (nth 1 ovs) 'display)))
+      (should-not (string-match-p "\n" (overlay-get (nth 1 ovs) 'display)))
+      (should (string-match-p "content" (overlay-get (nth 2 ovs) 'display)))
+      (should (string-match-p "└" (overlay-get (nth 2 ovs) 'display)))
+      ;; Each overlay starts at its own buffer line.
+      (should (equal (mapcar (lambda (ov) (line-number-at-pos (overlay-start ov)))
+                             ovs)
+                     '(2 3 4))))
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-row-strings-join-to-display-string ()
+  "Joining the row strings gives exactly the whole-table rendering."
+  (let ((rows '(("Header" "Other") hline ("short" "x")
+                ("this cell is long enough to wrap" "y")))
+        (widths (vector 10 5))
+        (org-table-wrap-row-separators t))
+    (should (equal (mapconcat #'identity
+                              (org-table-wrap--build-row-strings rows widths)
+                              "\n")
+                   (org-table-wrap--build-display-string rows widths)))
+    (should (= (length (org-table-wrap--build-row-strings rows widths))
+               (length rows)))))
+
+;;;; Scrolling
+
+(ert-deftest org-table-wrap-test-scrolling-into-table-does-not-reveal ()
+  "Point carried into a rendered table by scrolling keeps it rendered."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (goto-char (point-min))
+    (forward-line 1)                    ; on the first table line
+    (let ((this-command 'mwheel-scroll))
+      (org-table-wrap--post-command))
+    (should (= (length (org-table-wrap-test--live-overlays)) 1))
+    (should (null org-table-wrap--current-table))
+    ;; A non-scroll command with point still there reveals the table.
+    (let ((this-command 'forward-char))
+      (org-table-wrap--post-command))
+    (should (null (org-table-wrap-test--live-overlays)))
+    (should org-table-wrap--current-table)
+    (org-table-wrap-mode -1)))
+
+(ert-deftest org-table-wrap-test-scrolling-out-rewraps-revealed-table ()
+  "Scrolling point out of a revealed table re-renders it."
+  (org-table-wrap-test-with-width 30 org-table-wrap-test--wide-table
+    (org-table-wrap-mode 1)
+    (goto-char (point-min))
+    (forward-line 1)
+    (let ((this-command 'next-line))
+      (org-table-wrap--post-command))
+    (should (null (org-table-wrap-test--live-overlays)))
+    (let (timers)
+      (org-table-wrap-test--capturing-idle-timers timers
+        (goto-char (point-max))
+        (let ((this-command 'pixel-scroll-precision))
+          (org-table-wrap--post-command))
+        (dolist (call (reverse timers))
+          (apply (car call) (cdr call)))))
+    (should (= (length (org-table-wrap-test--live-overlays)) 1))
+    (org-table-wrap-mode -1)))
 
 (provide 'org-table-wrap-test)
 ;;; org-table-wrap-test.el ends here

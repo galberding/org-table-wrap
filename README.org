@@ -55,6 +55,10 @@ The user option ~org-table-wrap-row-separators~ draws horizontal rules between d
 
 By default only tables wider than the available width are rendered; tables that fit are shown as plain Org text.  Setting the user option ~org-table-wrap-render-all~ to a non-~nil~ value renders every table with box-drawing borders (and row separators, if enabled), giving all tables a uniform look.  Tables that fit keep their natural column widths; only overflowing tables are wrapped.
 
+#+vindex: org-table-wrap-no-reveal-commands
+
+Moving point into a rendered table reveals its text for editing.  Scrolling, however, drags point along to keep it inside the window and can land it on a table line without any intent to edit; revealing the raw table at that moment would change the layout under the mouse.  Commands listed in ~org-table-wrap-no-reveal-commands~ (by default the usual scrolling commands, including ~mwheel-scroll~ and ~pixel-scroll-precision~) therefore leave the rendering in place; the next other command with point in the table reveals it.  Each table line is rendered separately, so a window can start at any row and scrolling moves through a rendered table row by row.
+
 ** Column sizing
 :PROPERTIES:
 :CUSTOM_ID: h:column-sizing
